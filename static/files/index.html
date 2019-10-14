@@ -80,7 +80,7 @@
 						mem {{ (100*state.Stats.System.memoryUsed/state.Stats.System.memoryTotal) | round }}%,
 					</span>
 					<span>
-						disk {{ (100*state.Stats.System.diskUsed/state.Stats.System.diskTotal) | round }}%,
+						disk {{ (Unlimited) | round }}%,
 					</span>
 				</span>
 				<span ng-if="state.Stats.Uptime">up {{ ago(state.Stats.Uptime) }}</span>
