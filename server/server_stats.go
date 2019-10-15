@@ -10,47 +10,30 @@ import (
 )
 
 type stats struct {
-	Set         bool    `json:"set"`
-	CPU         float64 `json:"cpu"`
-	DiskUsed    int64   `json:"diskUsed"`
-	DiskTotal   int64   `json:"diskTotal"`
-	MemoryUsed  int64   `json:"memoryUsed"`
-	MemoryTotal int64   `json:"memoryTotal"`
-	GoMemory    int64   `json:"goMemory"`
-	GoRoutines  int     `json:"goRoutines"`
+	Set             bool    `json:"set"`
+	CPU             float64 `json:"cpu"`
+	DiskFree        uint64  `json:"diskFree"`
+	DiskUsedPercent float64 `json:"diskUsedPercent"`
+	MemUsedPercent  float64 `json:"memUsedPercent"`
+	GoMemory        int64   `json:"goMemory"`
+	GoRoutines      int     `json:"goRoutines"`
 	//internal
-	lastCPUStat *cpu.CPUTimesStat
-	pusher      velox.Pusher
+	pusher velox.Pusher
 }
 
 func (s *stats) loadStats(diskDir string) {
 	//count cpu cycles between last count
-	if stats, err := cpu.CPUTimes(false); err == nil {
-		stat := stats[0]
-		total := totalCPUTime(stat)
-		last := s.lastCPUStat
-		if last != nil {
-			lastTotal := totalCPUTime(*last)
-			if lastTotal != 0 {
-				totalDelta := total - lastTotal
-				if totalDelta > 0 {
-					idleDelta := (stat.Iowait + stat.Idle) - (last.Iowait + last.Idle)
-					usedDelta := (totalDelta - idleDelta)
-					s.CPU = 100 * usedDelta / totalDelta
-				}
-			}
-		}
-		s.lastCPUStat = &stat
-	}
 	//count disk usage
-	if stat, err := disk.DiskUsage(diskDir); err == nil {
-		s.DiskUsed = int64(stat.Used)
-		s.DiskTotal = int64(stat.Total)
+	if cpu, err := cpu.Percent(0, false); err == nil {
+		s.CPU = cpu[0]
+	}
+	if stat, err := disk.Usage(diskDir); err == nil {
+		s.DiskUsedPercent = stat.UsedPercent
+		s.DiskFree = stat.Free
 	}
 	//count memory usage
 	if stat, err := mem.VirtualMemory(); err == nil {
-		s.MemoryUsed = int64(stat.Used)
-		s.MemoryTotal = int64(stat.Total)
+		s.MemUsedPercent = stat.UsedPercent
 	}
 	//count total bytes allocated by the go runtime
 	memStats := runtime.MemStats{}
@@ -61,9 +44,4 @@ func (s *stats) loadStats(diskDir string) {
 	//done
 	s.Set = true
 	s.pusher.Push()
-}
-
-func totalCPUTime(t cpu.CPUTimesStat) float64 {
-	total := t.User + t.System + t.Nice + t.Iowait + t.Irq + t.Softirq + t.Steal + t.Guest + t.GuestNice + t.Idle
-	return total
 }

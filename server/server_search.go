@@ -6,14 +6,16 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"time"
-
-	"github.com/jpillora/backoff"
 )
 
-const searchConfigURL = "https://gist.githubusercontent.com/jpillora/4d945b46b3025843b066adf3d685be6b/raw/scraper-config.json"
+const searchConfigURL = "https://gistcdn.githack.com/boypt/9bf0e3e876502ae8e521d9ba0487e0e1/raw/scraper-config.json"
 
 func (s *Server) fetchSearchConfigLoop() {
+	s.fetchSearchConfig()
+	return
+
+	// search scraper is not updated frequently
+	/********
 	b := backoff.Backoff{Max: 30 * time.Minute}
 	for {
 		if err := s.fetchSearchConfig(); err != nil {
@@ -25,12 +27,14 @@ func (s *Server) fetchSearchConfigLoop() {
 			b.Reset()
 		}
 	}
+	********/
 }
 
 var fetches = 0
 var currentConfig, _ = normalize(defaultSearchConfig)
 
 func (s *Server) fetchSearchConfig() error {
+	log.Println("fetchSearchConfig: loading search config from", searchConfigURL)
 	resp, err := http.Get(searchConfigURL)
 	if err != nil {
 		return err

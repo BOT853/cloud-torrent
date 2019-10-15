@@ -64,13 +64,24 @@ app.controller("OmniController", function(
   };
 
   var parseSearch = function() {
+    var r = document.querySelector("#omni_search_results div.results");
+    if (r !== null) {
+      r.scrollTop = 0;
+    }
     $scope.mode.search = true;
-    while ($scope.results.length) $scope.results.pop();
+    $scope.results.length = 0;
+  };
+
+  $scope.clearSearch = function(){
+    $scope.inputs.omni = "";
+    $scope.results.length = 0;
   };
 
   $scope.parse = function() {
     storage.tcOmni = $scope.inputs.omni;
     $scope.omnierr = null;
+    $rootScope.err = null;
+
     //set all 3 to false,
     //one will set to be true
     $scope.mode = {
@@ -142,6 +153,7 @@ app.controller("OmniController", function(
     } else {
       window.alert("UI Bug");
     }
+    $rootScope.set_torrent_expanded(true);
   };
 
   $scope.submitSearch = function() {
@@ -215,6 +227,7 @@ app.controller("OmniController", function(
         $scope.omnierr = err;
       }
     );
+    $rootScope.set_torrent_expanded(true);
   };
 
   // $var uploadFile = function(files) {

@@ -110,5 +110,6 @@ func list(path string, info os.FileInfo, node *fsNode, n *int) error {
 		node.Size += c.Size
 		node.Children = append(node.Children, c)
 	}
+
 	return nil
 }

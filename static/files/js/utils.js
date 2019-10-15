@@ -61,10 +61,15 @@ app.factory("storage", function() {
   return window.localStorage || {};
 });
 
-app.factory("reqerr", function() {
+app.factory("reqerr", function($rootScope) {
   return function(err, status) {
-    alert(err.error || err);
-    console.error("request error '%s' (%s)", err, status);
+    var msg = err;
+    if (typeof err === "object" && "error" in err) {
+      msg = err.error;
+    }
+    $rootScope.err = `${msg} (${status})`
+    $rootScope.$apply();
+    console.log(msg, status);
   };
 });
 
@@ -124,6 +129,18 @@ app.filter("round", function() {
     return Math.round(n * 10) / 10;
   };
 });
+
+app.filter('dictValuesArray', function () {
+  return function (obj) {
+      if (!(obj instanceof Object)) return obj;
+
+      var arr = [];
+      for (var key in obj) {
+          arr.push(obj[key]);
+      }
+      return arr;
+  }
+})
 
 app.directive("ngEnter", function() {
   return function(scope, element, attrs) {
