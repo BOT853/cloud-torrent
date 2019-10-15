@@ -27,7 +27,7 @@ func main() {
 		log.SetFlags(0)
 	}
 
-	log.Printf("############# SimpleTorrent ver[%s] #############\n", VERSION)
+	log.Printf("############# Malaysia ver[%s] #############\n", VERSION)
 	if err := s.Run(VERSION); err != nil {
 		log.Fatal(err)
 	}
