@@ -1,26 +1,34 @@
 package engine
 
 import (
-	"encoding/hex"
+	"bufio"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/anacrolix/dht"
+	eglog "github.com/anacrolix/log"
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 )
 
+const (
+	cacheSavedPrefix = "_CLDAUTOSAVED_"
+)
+
 //the Engine Cloud Torrent engine, backed by anacrolix/torrent
 type Engine struct {
-	mut      sync.Mutex
-	cacheDir string
-	client   *torrent.Client
-	config   Config
-	ts       map[string]*Torrent
+	mut       sync.Mutex
+	cacheDir  string
+	client    *torrent.Client
+	config    Config
+	ts        map[string]*Torrent
+	bttracker []string
 }
 
 func New() *Engine {
@@ -40,22 +48,31 @@ func (e *Engine) Configure(c Config) error {
 	if c.IncomingPort <= 0 {
 		return fmt.Errorf("Invalid incoming port (%d)", c.IncomingPort)
 	}
-	tc := torrent.Config{
-		DHTConfig: dht.ServerConfig{
-			StartingNodes: dht.GlobalBootstrapAddrs,
-		},
-		DataDir:    c.DownloadDirectory,
-		ListenAddr: "0.0.0.0:" + strconv.Itoa(c.IncomingPort),
-		NoUpload:   !c.EnableUpload,
-		Seed:       c.EnableSeeding,
+	tc := torrent.NewDefaultClientConfig()
+	tc.ListenPort = c.IncomingPort
+	tc.DataDir = c.DownloadDirectory
+	tc.Debug = c.EngineDebug
+	if e.config.MuteEngineLog {
+		tc.Logger = eglog.Discard
 	}
-	tc.DisableEncryption = c.DisableEncryption
+	tc.NoUpload = !c.EnableUpload
+	tc.Seed = c.EnableSeeding
+	tc.UploadRateLimiter = c.UploadLimiter()
+	tc.DownloadRateLimiter = c.DownloadLimiter()
+	tc.HeaderObfuscationPolicy = torrent.HeaderObfuscationPolicy{
+		Preferred:        c.ObfsPreferred,
+		RequirePreferred: c.ObfsRequirePreferred,
+	}
+	tc.DisableTrackers = c.DisableTrackers
+	tc.DisableIPv6 = c.DisableIPv6
+	tc.ProxyURL = c.ProxyURL
 
-	client, err := torrent.NewClient(&tc)
+	client, err := torrent.NewClient(tc)
 	if err != nil {
 		return err
 	}
 	e.mut.Lock()
+	e.cacheDir = c.WatchDirectory
 	e.config = c
 	e.client = client
 	e.mut.Unlock()
@@ -80,14 +97,45 @@ func (e *Engine) NewTorrent(spec *torrent.TorrentSpec) error {
 	return e.newTorrent(tt)
 }
 
+func (e *Engine) NewFileTorrent(path string) error {
+	info, err := metainfo.LoadFromFile(path)
+	if err != nil {
+		return err
+	}
+	spec := torrent.TorrentSpecFromMetaInfo(info)
+	return e.NewTorrent(spec)
+}
+
 func (e *Engine) newTorrent(tt *torrent.Torrent) error {
+	meta := tt.Metainfo()
+	if len(e.bttracker) > 0 && (e.config.AlwaysAddTrackers || len(meta.AnnounceList) == 0) {
+		log.Printf("[newTorrent] added %d public trackers\n", len(e.bttracker))
+		tt.AddTrackers([][]string{e.bttracker})
+	}
 	t := e.upsertTorrent(tt)
 	go func() {
 		<-t.t.GotInfo()
-		// if e.config.AutoStart && !loaded && torrent.Loaded && !torrent.Started {
-		e.StartTorrent(t.InfoHash)
-		// }
+		if e.config.AutoStart {
+			e.StartTorrent(t.InfoHash)
+			if w, err := os.Stat(e.cacheDir); err == nil && w.IsDir() {
+				cacheFilePath := filepath.Join(e.cacheDir,
+					fmt.Sprintf("%s%s.torrent", cacheSavedPrefix, t.InfoHash))
+				// only create the cache file if not exists
+				// avoid recreating a cache file during booting import
+				if _, err := os.Stat(cacheFilePath); os.IsNotExist(err) {
+					cf, err := os.Create(cacheFilePath)
+					if err == nil {
+						umeta := t.t.Metainfo()
+						umeta.Write(cf)
+					} else {
+						log.Println("[newTorrent] failed to create torrent file ", err)
+					}
+					cf.Close()
+				}
+			}
+		}
 	}()
+
 	return nil
 }
 
@@ -101,16 +149,58 @@ func (e *Engine) GetTorrents() map[string]*Torrent {
 		return nil
 	}
 	for _, tt := range e.client.Torrents() {
-		e.upsertTorrent(tt)
+		t := e.upsertTorrent(tt)
+		e.torrentRoutine(t)
 	}
 	return e.ts
+}
+
+func (e *Engine) torrentRoutine(t *Torrent) {
+
+	// stops task on reaching ratio
+	if e.config.SeedRatio > 0 &&
+		t.SeedRatio > e.config.SeedRatio &&
+		t.Started &&
+		t.Done {
+		log.Println("[Task Stoped] due to reaching SeedRatio")
+		go e.StopTorrent(t.InfoHash)
+	}
+
+	// call DoneCmd on task completed
+	if t.Done && !t.DoneCmdCalled {
+		t.DoneCmdCalled = true
+		env := append(os.Environ(),
+			fmt.Sprintf("CLD_DIR=%s", e.config.DownloadDirectory),
+			fmt.Sprintf("CLD_PATH=%s", t.Name),
+			fmt.Sprintf("CLD_SIZE=%d", t.Size),
+			"CLD_TYPE=torrent",
+		)
+		go e.callDoneCmd(env)
+	}
+
+	// call DoneCmd on each file completed
+	for _, f := range t.Files {
+		if f.Done && !f.DoneCmdCalled {
+			f.DoneCmdCalled = true
+			env := append(os.Environ(),
+				fmt.Sprintf("CLD_DIR=%s", e.config.DownloadDirectory),
+				fmt.Sprintf("CLD_PATH=%s", f.Path),
+				fmt.Sprintf("CLD_SIZE=%d", f.Size),
+				"CLD_TYPE=file",
+			)
+			go e.callDoneCmd(env)
+		}
+	}
 }
 
 func (e *Engine) upsertTorrent(tt *torrent.Torrent) *Torrent {
 	ih := tt.InfoHash().HexString()
 	torrent, ok := e.ts[ih]
 	if !ok {
-		torrent = &Torrent{InfoHash: ih}
+		torrent = &Torrent{
+			InfoHash: ih,
+			AddedAt:  time.Now(),
+		}
 		e.ts[ih] = torrent
 	}
 	//update torrent fields using underlying torrent
@@ -119,10 +209,7 @@ func (e *Engine) upsertTorrent(tt *torrent.Torrent) *Torrent {
 }
 
 func (e *Engine) getTorrent(infohash string) (*Torrent, error) {
-	ih, err := str2ih(infohash)
-	if err != nil {
-		return nil, err
-	}
+	ih := metainfo.NewHashFromHex(infohash)
 	t, ok := e.ts[ih.HexString()]
 	if !ok {
 		return t, fmt.Errorf("Missing torrent %x", ih)
@@ -135,13 +222,6 @@ func (e *Engine) getOpenTorrent(infohash string) (*Torrent, error) {
 	if err != nil {
 		return nil, err
 	}
-	// if t.t == nil {
-	// 	newt, err := e.client.AddTorrentFromFile(filepath.Join(e.cacheDir, infohash+".torrent"))
-	// 	if err != nil {
-	// 		return t, fmt.Errorf("Failed to open torrent %s", err)
-	// 	}
-	// 	t.t = &newt
-	// }
 	return t, nil
 }
 
@@ -176,6 +256,8 @@ func (e *Engine) StopTorrent(infohash string) error {
 	//there is no stop - kill underlying torrent
 	t.t.Drop()
 	t.Started = false
+	t.UploadRate = 0
+	t.DownloadRate = 0
 	for _, f := range t.Files {
 		if f != nil {
 			f.Started = false
@@ -189,9 +271,12 @@ func (e *Engine) DeleteTorrent(infohash string) error {
 	if err != nil {
 		return err
 	}
-	os.Remove(filepath.Join(e.cacheDir, infohash+".torrent"))
+
+	cacheFilePath := filepath.Join(e.cacheDir,
+		fmt.Sprintf("%s%s.torrent", cacheSavedPrefix, infohash))
+	os.Remove(cacheFilePath)
 	delete(e.ts, t.InfoHash)
-	ih, _ := str2ih(infohash)
+	ih := metainfo.NewHashFromHex(infohash)
 	if tt, ok := e.client.Torrent(ih); ok {
 		tt.Drop()
 	}
@@ -218,7 +303,7 @@ func (e *Engine) StartFile(infohash, filepath string) error {
 	}
 	t.Started = true
 	f.Started = true
-	f.f.PrioritizeRegion(0, f.Size)
+	f.f.Download()
 	return nil
 }
 
@@ -226,14 +311,49 @@ func (e *Engine) StopFile(infohash, filepath string) error {
 	return fmt.Errorf("Unsupported")
 }
 
-func str2ih(str string) (metainfo.Hash, error) {
-	var ih metainfo.Hash
-	e, err := hex.Decode(ih[:], []byte(str))
+func (e *Engine) callDoneCmd(env []string) {
+	if e.config.DoneCmd == "" {
+		return
+	}
+	cmd := exec.Command(e.config.DoneCmd)
+	cmd.Env = env
+	log.Printf("[DoneCmd] [%s] environ:%v", e.config.DoneCmd, cmd.Env)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return ih, fmt.Errorf("Invalid hex string")
+		log.Println("[DoneCmd] Err:", err)
 	}
-	if e != 20 {
-		return ih, fmt.Errorf("Invalid length")
+	log.Println("[DoneCmd] Output:", string(out))
+}
+
+func (e *Engine) UpdateTrackers() error {
+	var txtlines []string
+	url := e.config.TrackerListURL
+
+	if !strings.HasPrefix(url, "https://") {
+		err := fmt.Errorf("UpdateTrackers: trackers url invalid: %s (only https:// supported), extra trackers list now empty.", url)
+		log.Print(err.Error())
+		e.bttracker = txtlines
+		return err
 	}
-	return ih, nil
+
+	log.Printf("UpdateTrackers: loading trackers from %s\n", url)
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Split(bufio.ScanLines)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		txtlines = append(txtlines, line)
+	}
+
+	e.bttracker = txtlines
+	log.Printf("UpdateTrackers: loaded %d trackers \n", len(txtlines))
+	return nil
 }
